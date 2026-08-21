@@ -47,6 +47,7 @@ import { SingleUserOAuthProvider } from "./oauth-provider.js";
 import {
   McpSessionRegistry,
   type McpSessionCloseResult,
+  type McpSessionReservation,
 } from "./mcp-sessions.js";
 import { ProcessSessionManager, type ProcessSnapshot } from "./process-sessions.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
@@ -67,6 +68,7 @@ type Transport = StreamableHTTPServerTransport;
 // session retention so abandoned MCP servers do not accumulate for the life of the process.
 const MCP_SESSION_IDLE_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
 const MCP_SESSION_CLEANUP_INTERVAL_MS = 5 * 60 * 1_000;
+const MCP_SESSION_MAX_SESSIONS = 64;
 const WORKSPACE_APP_URI = "ui://devspace/workspace-app.html";
 const WORKSPACE_APP_MANIFEST_ENTRY = "workspace-app.html";
 const WRITE_TOOL_ANNOTATIONS = {
@@ -1678,7 +1680,9 @@ export function createServer(
     host: config.host,
     ...(allowedHosts ? { allowedHosts } : {}),
   });
-  const transports = new McpSessionRegistry<Transport>();
+  const transports = new McpSessionRegistry<Transport>({
+    maxSessions: MCP_SESSION_MAX_SESSIONS,
+  });
   const mcpUrl = new URL("/mcp", config.publicBaseUrl);
   const resourceServerUrl = resourceUrlFromServerUrl(mcpUrl);
   const oauthProvider = new SingleUserOAuthProvider(config.oauth, mcpUrl, config.stateDir);
@@ -1696,8 +1700,8 @@ export function createServer(
     : [];
 
   const logSessionCloseResults = (
-    reason: "idle_timeout" | "server_shutdown",
-    results: McpSessionCloseResult[],
+    reason: "idle_timeout" | "capacity_eviction" | "server_shutdown",
+    results: readonly McpSessionCloseResult[],
   ) => {
     for (const result of results) {
       if (result.error) {
@@ -1780,7 +1784,13 @@ export function createServer(
   );
 
   app.get("/healthz", (_req, res) => {
-    res.json({ ok: true, name: "devspace" });
+    res.json({
+      ok: true,
+      name: "devspace",
+      mcpSessions: transports.size,
+      occupiedSessionCapacity: transports.occupiedCapacity,
+      maxMcpSessions: MCP_SESSION_MAX_SESSIONS,
+    });
   });
 
   app.all("/mcp", async (req, res) => {
@@ -1816,23 +1826,50 @@ export function createServer(
       isInitialize: initializeRequest,
     });
 
+    let activeSessionId: string | undefined;
+    let reservation: McpSessionReservation | undefined;
     try {
       let transport: Transport | undefined;
 
       if (sessionId) {
-        transport = transports.get(sessionId);
+        transport = transports.markActive(sessionId);
         if (!transport) {
           sendJsonRpcError(res, 404, -32000, "Unknown MCP session");
           return;
         }
+        activeSessionId = sessionId;
       } else if (initializeRequest) {
+        reservation = await transports.reserve();
+        if (!reservation) {
+          logEvent(config.logging, "warn", "mcp_session_capacity_rejected", {
+            requestId,
+            maxSessions: MCP_SESSION_MAX_SESSIONS,
+            sessions: transports.size,
+            occupiedCapacity: transports.occupiedCapacity,
+            ...requestLogFields(req, config),
+          });
+          sendJsonRpcError(res, 503, -32000, "MCP server session capacity is exhausted");
+          return;
+        }
+        logSessionCloseResults("capacity_eviction", reservation.closeResults);
+        if (reservation.closeResults.some((result) => result.error !== undefined)) {
+          sendJsonRpcError(res, 503, -32000, "MCP server session capacity reclamation failed");
+          return;
+        }
+
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: (newSessionId) => {
-            if (transport) transports.register(newSessionId, transport);
+            if (transport && reservation) {
+              transports.commit(reservation, newSessionId, transport);
+              reservation = undefined;
+              activeSessionId = newSessionId;
+            }
             logEvent(config.logging, "info", "mcp_session_created", {
               requestId,
               sessionIdPrefix: sessionIdPrefix(newSessionId),
+              sessions: transports.size,
+              occupiedCapacity: transports.occupiedCapacity,
               ...requestLogFields(req, config),
             });
           },
@@ -1871,6 +1908,9 @@ export function createServer(
       if (!res.headersSent) {
         sendJsonRpcError(res, 500, -32603, "Internal server error");
       }
+    } finally {
+      if (activeSessionId) transports.markIdle(activeSessionId);
+      if (reservation) transports.release(reservation);
     }
   });
 
