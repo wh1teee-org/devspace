@@ -17,6 +17,7 @@ export interface StartCommandInput {
   command: string;
   cwd: string;
   workspaceRoot?: string;
+  environment?: Record<string, string>;
   tty?: boolean;
   columns?: number;
   rows?: number;
@@ -42,6 +43,11 @@ export interface ProcessSnapshot {
   exitCode?: number;
   signal?: string;
   wallTimeMs: number;
+}
+
+export interface ProcessSessionController {
+  start(input: StartCommandInput): Promise<ProcessSnapshot>;
+  write(input: WriteStdinInput): Promise<ProcessSnapshot>;
 }
 
 interface ManagedProcess {
@@ -90,11 +96,14 @@ function terminalSize(value: number | undefined, fallback: number): number {
 function processEnvironment(input?: {
   workspaceId?: string;
   workspaceRoot?: string;
+  environment?: Record<string, string>;
 }): Record<string, string> {
-  return {
-    ...Object.fromEntries(
+  const baseEnvironment = input?.environment
+    ?? Object.fromEntries(
       Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined),
-    ),
+    );
+  return {
+    ...baseEnvironment,
     NO_COLOR: "1",
     TERM: "dumb",
     PAGER: "cat",
@@ -222,6 +231,18 @@ export class ProcessSessionManager {
     this.completedSessionTtlMs = options.completedSessionTtlMs ?? COMPLETED_SESSION_TTL_MS;
   }
 
+  get runningCount(): number {
+    let count = 0;
+    for (const session of this.sessions.values()) {
+      if (session.running) count += 1;
+    }
+    return count;
+  }
+
+  get sessionCount(): number {
+    return this.sessions.size;
+  }
+
   async start(input: StartCommandInput): Promise<ProcessSnapshot> {
     const session = this.createSession(input);
     this.sessions.set(session.id, session);
@@ -330,14 +351,16 @@ export class ProcessSessionManager {
   }
 
   private startPipe(session: ProcessSession, input: StartCommandInput): void {
-    const shell = resolveShellCommand(input.command);
+    const environment = processEnvironment({
+      workspaceId: input.workspaceId,
+      workspaceRoot: input.workspaceRoot,
+      environment: input.environment,
+    });
+    const shell = resolveShellCommand(input.command, process.platform, environment);
     const detached = process.platform !== "win32";
     const child = spawn(input.command, {
       cwd: input.cwd,
-      env: processEnvironment({
-        workspaceId: input.workspaceId,
-        workspaceRoot: input.workspaceRoot,
-      }),
+      env: environment,
       stdio: "pipe",
       windowsHide: true,
       detached,
@@ -363,15 +386,17 @@ export class ProcessSessionManager {
       throw new Error("PTY support requires the optional node-pty dependency.");
     }
 
-    const shell = resolveShellCommand(input.command);
+    const environment = processEnvironment({
+      workspaceId: input.workspaceId,
+      workspaceRoot: input.workspaceRoot,
+      environment: input.environment,
+    });
+    const shell = resolveShellCommand(input.command, process.platform, environment);
     let pty: import("node-pty").IPty;
     try {
       pty = nodePty.spawn(shell.executable, shell.args, {
         cwd: input.cwd,
-        env: processEnvironment({
-          workspaceId: input.workspaceId,
-          workspaceRoot: input.workspaceRoot,
-        }),
+        env: environment,
         name: "xterm-256color",
         cols: session.columns,
         rows: session.rows,
