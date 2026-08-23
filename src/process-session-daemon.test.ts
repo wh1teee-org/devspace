@@ -8,6 +8,7 @@ import {
   ProcessSessionDaemon,
   processSessionDaemonPaths,
   processSessionDaemonExecArgv,
+  spawnProcessSessionDaemon,
 } from "./process-session-daemon.js";
 
 const node = process.platform === "win32"
@@ -35,6 +36,17 @@ test("linux process daemon uses a bounded abstract socket endpoint", () => {
   const paths = processSessionDaemonPaths(stateDir, "linux");
   assert.equal(paths.endpoint.startsWith("\0devspace-processd-"), true);
   assert.equal(Buffer.byteLength(paths.endpoint) < 100, true);
+});
+
+test("externally managed process daemon never spawns a fallback", () => {
+  assert.throws(
+    () => spawnProcessSessionDaemon("/tmp/devspace-managed-processd", {
+      DEVSPACE_PROCESS_SESSION_DAEMON_MANAGED: "1",
+    }),
+    (error: unknown) =>
+      error instanceof Error
+      && error.message.includes("externally managed"),
+  );
 });
 
 test("process sessions survive client recreation", async () => {
