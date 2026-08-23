@@ -9,7 +9,8 @@
   },
   "bin": {
     "devspace": "dist/cli.js",
-    "devspace-agentd": "dist/local-agent-daemon-main.js"
+    "devspace-agentd": "dist/local-agent-daemon-main.js",
+    "devspace-processd": "dist/process-session-daemon-main.js"
   },
   "files": [
     "dist",

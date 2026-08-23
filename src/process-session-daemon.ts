@@ -435,7 +435,17 @@ export function processSessionDaemonPaths(
   };
 }
 
-export function spawnProcessSessionDaemon(stateDir: string): void {
+export function spawnProcessSessionDaemon(
+  stateDir: string,
+  env: NodeJS.ProcessEnv = process.env,
+): void {
+  if (env.DEVSPACE_PROCESS_SESSION_DAEMON_MANAGED === "1") {
+    throw new ProcessSessionDaemonError(
+      "DAEMON_STARTUP_FAILURE",
+      "Process session daemon is externally managed and unavailable; refusing to start a fallback process.",
+      true,
+    );
+  }
   const entrypoint = resolveProcessSessionDaemonEntrypoint();
   const execArgv = processSessionDaemonExecArgv(process.execArgv);
   const userSystemd = linuxUserSystemdRuntime();
@@ -454,7 +464,7 @@ export function spawnProcessSessionDaemon(stateDir: string): void {
       entrypoint,
     ], {
       env: {
-        ...process.env,
+        ...env,
         XDG_RUNTIME_DIR: userSystemd.runtimeDir,
         DBUS_SESSION_BUS_ADDRESS: `unix:path=${userSystemd.busPath}`,
       },
@@ -483,7 +493,7 @@ export function spawnProcessSessionDaemon(stateDir: string): void {
     detached: true,
     stdio: "ignore",
     windowsHide: true,
-    env: { ...process.env, DEVSPACE_STATE_DIR: resolve(stateDir) },
+    env: { ...env, DEVSPACE_STATE_DIR: resolve(stateDir) },
   });
   child.unref();
 }
