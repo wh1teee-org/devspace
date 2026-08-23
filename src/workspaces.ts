@@ -89,6 +89,10 @@ export interface ManagedWorkspaceReconciliationResult {
   nextCursor?: string;
 }
 
+export interface WorkspaceRegistryOptions {
+  maxResidentWorkspaces?: number;
+}
+
 type PathStats = Stats;
 type DirectoryOps = {
   stat: (path: string) => Promise<PathStats>;
@@ -96,16 +100,31 @@ type DirectoryOps = {
 };
 
 const SESSION_TOUCH_INTERVAL_MS = 30_000;
+const parsedMaxResidentWorkspaces = Number.parseInt(
+  process.env.DEVSPACE_MAX_RESIDENT_WORKSPACES ?? "512",
+  10,
+);
+const DEFAULT_MAX_RESIDENT_WORKSPACES =
+  Number.isSafeInteger(parsedMaxResidentWorkspaces) && parsedMaxResidentWorkspaces >= 16
+    ? parsedMaxResidentWorkspaces
+    : 512;
 
 export class WorkspaceRegistry {
   private readonly workspaces = new Map<string, Workspace>();
   private readonly pendingCheckoutOpens = new Map<string, Promise<WorkspaceContext>>();
   private readonly lastPersistedSessionTouchAt = new Map<string, number>();
+  private readonly maxResidentWorkspaces: number;
 
   constructor(
     private readonly config: ServerConfig,
     private readonly store?: WorkspaceStore,
-  ) {}
+    options: WorkspaceRegistryOptions = {},
+  ) {
+    this.maxResidentWorkspaces = options.maxResidentWorkspaces ?? DEFAULT_MAX_RESIDENT_WORKSPACES;
+    if (!Number.isSafeInteger(this.maxResidentWorkspaces) || this.maxResidentWorkspaces < 1) {
+      throw new Error("Resident workspace capacity must be a positive safe integer.");
+    }
+  }
 
   async openWorkspace(
     input: string | OpenWorkspaceInput,
@@ -256,6 +275,7 @@ export class WorkspaceRegistry {
   getWorkspace(workspaceId: string): Workspace {
     const workspace = this.workspaces.get(workspaceId);
     if (workspace) {
+      this.rememberWorkspace(workspace);
       this.touchSessionIfNeeded(workspaceId);
       return workspace;
     }
@@ -294,7 +314,7 @@ export class WorkspaceRegistry {
       activatedSkillDirs: new Set(),
     };
     this.touchSessionIfNeeded(workspaceId);
-    this.workspaces.set(restoredWorkspace.id, restoredWorkspace);
+    this.rememberWorkspace(restoredWorkspace);
 
     return restoredWorkspace;
   }
@@ -461,7 +481,7 @@ export class WorkspaceRegistry {
     if (persistedSession) {
       this.lastPersistedSessionTouchAt.set(workspace.id, Date.now());
     }
-    this.workspaces.set(workspace.id, workspace);
+    this.rememberWorkspace(workspace);
     const agentsFiles = await this.loadInitialAgentsFiles(workspace.root);
     const availableAgentsFiles = await this.findAvailableAgentsFiles(workspace.root, agentsFiles);
 
@@ -489,6 +509,17 @@ export class WorkspaceRegistry {
 
     this.store.touchSession(workspaceId);
     this.lastPersistedSessionTouchAt.set(workspaceId, now);
+  }
+
+  private rememberWorkspace(workspace: Workspace): void {
+    this.workspaces.delete(workspace.id);
+    this.workspaces.set(workspace.id, workspace);
+    while (this.workspaces.size > this.maxResidentWorkspaces) {
+      const oldestWorkspaceId = this.workspaces.keys().next().value;
+      if (oldestWorkspaceId === undefined) break;
+      this.workspaces.delete(oldestWorkspaceId);
+      this.lastPersistedSessionTouchAt?.delete(oldestWorkspaceId);
+    }
   }
 
   private loadSkillsForWorkspace(root: string): Pick<Workspace, "skills" | "skillDiagnostics"> {
