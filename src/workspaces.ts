@@ -88,9 +88,12 @@ type DirectoryOps = {
   mkdir: (path: string, options: { recursive: true }) => Promise<unknown>;
 };
 
+const SESSION_TOUCH_INTERVAL_MS = 30_000;
+
 export class WorkspaceRegistry {
   private readonly workspaces = new Map<string, Workspace>();
   private readonly pendingCheckoutOpens = new Map<string, Promise<WorkspaceContext>>();
+  private readonly lastPersistedSessionTouchAt = new Map<string, number>();
 
   constructor(
     private readonly config: ServerConfig,
@@ -175,6 +178,7 @@ export class WorkspaceRegistry {
       }
 
       this.workspaces.delete(binding.workspaceSessionId);
+      this.lastPersistedSessionTouchAt.delete(binding.workspaceSessionId);
       this.store?.deleteConversationBinding(conversationScopeId, targetKey);
     }
 
@@ -245,7 +249,7 @@ export class WorkspaceRegistry {
   getWorkspace(workspaceId: string): Workspace {
     const workspace = this.workspaces.get(workspaceId);
     if (workspace) {
-      this.store?.touchSession(workspaceId);
+      this.touchSessionIfNeeded(workspaceId);
       return workspace;
     }
 
@@ -277,7 +281,7 @@ export class WorkspaceRegistry {
       agentProfiles: [],
       activatedSkillDirs: new Set(),
     };
-    this.store?.touchSession(workspaceId);
+    this.touchSessionIfNeeded(workspaceId);
     this.workspaces.set(restoredWorkspace.id, restoredWorkspace);
 
     return restoredWorkspace;
@@ -367,7 +371,7 @@ export class WorkspaceRegistry {
       activatedSkillDirs: new Set(),
     };
 
-    this.store?.createSession({
+    const persistedSession = this.store?.createSession({
       id: workspace.id,
       root: workspace.root,
       mode: workspace.mode,
@@ -376,6 +380,9 @@ export class WorkspaceRegistry {
       baseSha: workspace.worktree?.baseSha,
       managed: workspace.worktree?.managed,
     });
+    if (persistedSession) {
+      this.lastPersistedSessionTouchAt.set(workspace.id, Date.now());
+    }
     this.workspaces.set(workspace.id, workspace);
     const agentsFiles = await this.loadInitialAgentsFiles(workspace.root);
     const availableAgentsFiles = await this.findAvailableAgentsFiles(workspace.root, agentsFiles);
@@ -387,6 +394,23 @@ export class WorkspaceRegistry {
       workspaceReused: false,
       includeBootstrapContext: true,
     };
+  }
+
+  private touchSessionIfNeeded(workspaceId: string): void {
+    if (!this.store) return;
+
+    const now = Date.now();
+    const lastTouchedAt = this.lastPersistedSessionTouchAt.get(workspaceId);
+    if (
+      lastTouchedAt !== undefined &&
+      now >= lastTouchedAt &&
+      now - lastTouchedAt < SESSION_TOUCH_INTERVAL_MS
+    ) {
+      return;
+    }
+
+    this.store.touchSession(workspaceId);
+    this.lastPersistedSessionTouchAt.set(workspaceId, now);
   }
 
   private loadSkillsForWorkspace(root: string): Pick<Workspace, "skills" | "skillDiagnostics"> {
