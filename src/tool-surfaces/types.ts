@@ -1,5 +1,5 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import type { ProcessSessionManager } from "../process-sessions.js";
+import type { ProcessSessionController } from "../process-sessions.js";
 import type { ServerConfig } from "../config.js";
 import type { WorkspaceRegistry } from "../workspaces.js";
 
@@ -77,7 +77,7 @@ export interface ToolRegistrationContext {
   server: McpServer;
   config: ServerConfig;
   workspaces: WorkspaceRegistry;
-  processSessions: ProcessSessionManager;
+  processSessions: ProcessSessionController;
 }
 
 export interface ToolInstructionContext {
