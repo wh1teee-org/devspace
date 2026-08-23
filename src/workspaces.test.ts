@@ -181,6 +181,33 @@ test("restored workspace persists one last-used touch before coalescing", async 
   }
 });
 
+test("resident workspace cache evicts the least recently used workspace", async (t) => {
+  const context = await fixture(t);
+  const store = new CountingWorkspaceStore(join(context.root, ".lru-state"));
+  const registry = new WorkspaceRegistry(context.config, store, {
+    maxResidentWorkspaces: 2,
+  });
+  const firstRoot = join(context.root, "first");
+  const secondRoot = join(context.root, "second");
+  const thirdRoot = join(context.root, "third");
+
+  try {
+    const first = await registry.openWorkspace(firstRoot);
+    const second = await registry.openWorkspace(secondRoot);
+
+    registry.getWorkspace(first.workspace.id);
+    await registry.openWorkspace(thirdRoot);
+
+    registry.getWorkspace(first.workspace.id);
+    assert.equal(store.touchCount, 0);
+
+    registry.getWorkspace(second.workspace.id);
+    assert.equal(store.touchCount, 1);
+  } finally {
+    store.close();
+  }
+});
+
 test("workspace paths outside the allowed roots are rejected", async (t) => {
   const context = await fixture(t);
 
