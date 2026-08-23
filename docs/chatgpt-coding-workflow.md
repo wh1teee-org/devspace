@@ -177,6 +177,11 @@ In this mode, `write`, `edit`, `bash`, `grep`, `glob`, and `ls` are not
 registered. `exec_command` returns a process session ID when a command is still
 running after its yield window. Use `write_stdin` to poll it, send input, resize
 a PTY, or send Ctrl-C. Set `tty: true` only for commands that need a terminal.
+Running process sessions are owned by a local process-session daemon rather
+than the HTTP/MCP server process, so restarting the DevSpace server does not
+discard or terminate an already-running command. A restarted server reconnects
+to the same daemon through the configured DevSpace state directory and can
+continue polling the original session ID.
 
 ## Show Changes
 
