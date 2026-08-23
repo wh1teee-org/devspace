@@ -133,6 +133,54 @@ test("persisted checkout and worktree sessions restore after recreating the regi
   }
 });
 
+test("hot workspace access coalesces persisted last-used writes", async (t) => {
+  const context = await fixture(t);
+  const store = new CountingWorkspaceStore(join(context.root, ".touch-state"));
+  const originalNow = Date.now;
+  let now = 1_000_000;
+  Date.now = () => now;
+
+  try {
+    const registry = new WorkspaceRegistry(context.config, store);
+    const opened = await registry.openWorkspace(context.root);
+
+    registry.getWorkspace(opened.workspace.id);
+    registry.getWorkspace(opened.workspace.id);
+    assert.equal(store.touchCount, 0);
+
+    now += 29_999;
+    registry.getWorkspace(opened.workspace.id);
+    assert.equal(store.touchCount, 0);
+
+    now += 1;
+    registry.getWorkspace(opened.workspace.id);
+    registry.getWorkspace(opened.workspace.id);
+    assert.equal(store.touchCount, 1);
+  } finally {
+    Date.now = originalNow;
+    store.close();
+  }
+});
+
+test("restored workspace persists one last-used touch before coalescing", async (t) => {
+  const context = await fixture(t);
+  const stateDir = join(context.root, ".restore-touch-state");
+  const firstStore = new SqliteWorkspaceStore(stateDir);
+  const firstRegistry = new WorkspaceRegistry(context.config, firstStore);
+  const opened = await firstRegistry.openWorkspace(context.root);
+  firstStore.close();
+
+  const secondStore = new CountingWorkspaceStore(stateDir);
+  try {
+    const restoredRegistry = new WorkspaceRegistry(context.config, secondStore);
+    restoredRegistry.getWorkspace(opened.workspace.id);
+    restoredRegistry.getWorkspace(opened.workspace.id);
+    assert.equal(secondStore.touchCount, 1);
+  } finally {
+    secondStore.close();
+  }
+});
+
 test("workspace paths outside the allowed roots are rejected", async (t) => {
   const context = await fixture(t);
 
@@ -254,4 +302,13 @@ async function createGitProject(parent: string): Promise<string> {
 
 async function git(cwd: string, args: string[]): Promise<void> {
   await execFileAsync("git", args, { cwd });
+}
+
+class CountingWorkspaceStore extends SqliteWorkspaceStore {
+  touchCount = 0;
+
+  override touchSession(id: string): void {
+    this.touchCount += 1;
+    super.touchSession(id);
+  }
 }
