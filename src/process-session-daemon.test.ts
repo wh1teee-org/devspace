@@ -81,6 +81,47 @@ test("process sessions survive client recreation", async () => {
   }
 });
 
+test("workspace release guard blocks process starts until released", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "devspace-process-daemon-release-guard-test-"));
+  const daemon = new ProcessSessionDaemon({ stateDir });
+  await daemon.start();
+
+  try {
+    const client = new ProcessSessionClient({ stateDir });
+    const guard = await client.acquireWorkspaceReleaseGuard("workspace-a");
+
+    await assert.rejects(
+      () => client.start({
+        workspaceId: "workspace-a",
+        cwd: process.cwd(),
+        command: `${node} -e "console.log('must-not-start')"`,
+        yieldTimeMs: 2_000,
+      }),
+      /being released/,
+    );
+
+    const otherWorkspace = await client.start({
+      workspaceId: "workspace-b",
+      cwd: process.cwd(),
+      command: `${node} -e "console.log('other-workspace')"`,
+      yieldTimeMs: 2_000,
+    });
+    assert.equal(otherWorkspace.exitCode, 0);
+
+    await guard.release();
+    const releasedWorkspace = await client.start({
+      workspaceId: "workspace-a",
+      cwd: process.cwd(),
+      command: `${node} -e "console.log('released')"`,
+      yieldTimeMs: 2_000,
+    });
+    assert.equal(releasedWorkspace.exitCode, 0);
+  } finally {
+    await daemon.close();
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
 test("process daemon preserves the calling environment", async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "devspace-process-daemon-env-test-"));
   const daemon = new ProcessSessionDaemon({ stateDir });
@@ -121,6 +162,11 @@ test("process daemon refuses shutdown while a command is running", async () => {
     });
     assert.equal(started.running, true);
     assert.ok(started.sessionId);
+
+    await assert.rejects(
+      () => client.acquireWorkspaceReleaseGuard("workspace-a"),
+      /running process session/,
+    );
 
     await assert.rejects(() => client.stop(), /running process sessions/);
 

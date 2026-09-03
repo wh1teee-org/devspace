@@ -2,7 +2,10 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod/v4";
 import type { ServerConfig } from "./config.js";
 import { logEvent } from "./logger.js";
-import type { ProcessSessionManager } from "./process-sessions.js";
+import type {
+  ProcessSessionController,
+  WorkspaceReleaseGuard,
+} from "./process-sessions.js";
 import type { WorkspaceSession } from "./workspace-store.js";
 import { logToolCall, textBlock } from "./tool-surfaces/shared.js";
 import { workspaceIdDescription } from "./tool-surfaces/types.js";
@@ -39,6 +42,13 @@ type TerminalWorkspaceSession = WorkspaceSession & {
   status: "released" | "missing";
 };
 
+interface WorkspaceLifecycleProcessSessions {
+  hasRunningForWorkspace?(workspaceId: string): boolean;
+  acquireWorkspaceReleaseGuard?(
+    workspaceId: string,
+  ): WorkspaceReleaseGuard | Promise<WorkspaceReleaseGuard>;
+}
+
 const reconciliationStates = new WeakMap<
   WorkspaceRegistry,
   ManagedWorkspaceReconciliationStatus
@@ -50,21 +60,10 @@ function isTerminalWorkspaceSession(
   return session.status === "released" || session.status === "missing";
 }
 
-export function releaseWorkspaceLease(
+function releaseTerminalWorkspace(
   workspaces: Pick<WorkspaceRegistry, "releaseWorkspace">,
-  processSessions: Pick<ProcessSessionManager, "hasRunningForWorkspace">,
   workspaceId: string,
 ): TerminalWorkspaceSession {
-  // Keep the running-process check and lifecycle transition synchronous with
-  // respect to the Node event loop: no await may appear between these calls.
-  // ProcessSessionManager.start() records its session before its first yield,
-  // so a concurrent start either wins and blocks close or sees a terminal ID.
-  if (processSessions.hasRunningForWorkspace(workspaceId)) {
-    throw new Error(
-      `Workspace ${workspaceId} still owns a running process session. Terminate or finish it before closing the workspace.`,
-    );
-  }
-
   const session = workspaces.releaseWorkspace(workspaceId);
   if (!isTerminalWorkspaceSession(session)) {
     throw new Error(
@@ -74,11 +73,50 @@ export function releaseWorkspaceLease(
   return session;
 }
 
+export function releaseWorkspaceLease(
+  workspaces: Pick<WorkspaceRegistry, "releaseWorkspace">,
+  processSessions: WorkspaceLifecycleProcessSessions,
+  workspaceId: string,
+): TerminalWorkspaceSession | Promise<TerminalWorkspaceSession> {
+  if (processSessions.acquireWorkspaceReleaseGuard) {
+    return Promise.resolve(
+      processSessions.acquireWorkspaceReleaseGuard(workspaceId),
+    ).then(async (guard) => {
+      try {
+        return releaseTerminalWorkspace(workspaces, workspaceId);
+      } finally {
+        try {
+          await guard.release();
+        } catch {
+          // The broker guard is fail-closed and process-local. A failed release
+          // leaves the workspace temporarily blocked rather than permitting a
+          // process-start race after terminalization.
+        }
+      }
+    });
+  }
+
+  if (!processSessions.hasRunningForWorkspace) {
+    throw new Error(
+      `Workspace ${workspaceId} process ownership cannot be proven; refusing to release its lease.`,
+    );
+  }
+
+  // The in-process manager records starts synchronously before its first yield.
+  // Keep this check and terminal transition in the same event-loop turn.
+  if (processSessions.hasRunningForWorkspace(workspaceId)) {
+    throw new Error(
+      `Workspace ${workspaceId} still owns a running process session. Terminate or finish it before closing the workspace.`,
+    );
+  }
+  return releaseTerminalWorkspace(workspaces, workspaceId);
+}
+
 export function registerWorkspaceLifecycleTool(
   server: McpServer,
   config: ServerConfig,
   workspaces: WorkspaceRegistry,
-  processSessions: ProcessSessionManager,
+  processSessions: ProcessSessionController,
 ): void {
   requestManagedWorkspaceReconciliation(config, workspaces);
 
@@ -110,7 +148,7 @@ export function registerWorkspaceLifecycleTool(
     },
     async ({ workspaceId }) => {
       const startedAt = performance.now();
-      const session = releaseWorkspaceLease(workspaces, processSessions, workspaceId);
+      const session = await releaseWorkspaceLease(workspaces, processSessions, workspaceId);
       const worktreeRetained = session.mode === "worktree" && session.managed;
       const result = {
         workspaceId: session.id,

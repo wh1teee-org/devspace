@@ -45,9 +45,17 @@ export interface ProcessSnapshot {
   wallTimeMs: number;
 }
 
+export interface WorkspaceReleaseGuard {
+  release(): void | Promise<void>;
+}
+
 export interface ProcessSessionController {
   start(input: StartCommandInput): Promise<ProcessSnapshot>;
   write(input: WriteStdinInput): Promise<ProcessSnapshot>;
+  shutdown?(): void;
+  acquireWorkspaceReleaseGuard?(
+    workspaceId: string,
+  ): WorkspaceReleaseGuard | Promise<WorkspaceReleaseGuard>;
 }
 
 interface ManagedProcess {

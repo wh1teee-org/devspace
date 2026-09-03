@@ -301,6 +301,22 @@ test("release fails closed when a DevSpace process owns the workspace", async ()
   assert.equal(releaseCalls, 0);
 });
 
+test("release fails closed without a process ownership authority", () => {
+  let releaseCalls = 0;
+  const workspaces = {
+    releaseWorkspace: () => {
+      releaseCalls += 1;
+      throw new Error("release must not run without process ownership authority");
+    },
+  };
+
+  assert.throws(
+    () => releaseWorkspaceLease(workspaces, {}, "ws_unproven"),
+    /process ownership cannot be proven/,
+  );
+  assert.equal(releaseCalls, 0);
+});
+
 test("release rejects a nonterminal lifecycle result", () => {
   const workspaces = {
     releaseWorkspace: () => ({
@@ -321,6 +337,49 @@ test("release rejects a nonterminal lifecycle result", () => {
     () => releaseWorkspaceLease(workspaces, processSessions, "ws_unknown"),
     /did not reach an explicit terminal lifecycle state/,
   );
+});
+
+test("broker release guard spans the terminal workspace transition", async () => {
+  let guarded = false;
+  let guardReleased = false;
+  const processSessions = {
+    acquireWorkspaceReleaseGuard: async (workspaceId: string) => {
+      assert.equal(workspaceId, "ws_guarded");
+      guarded = true;
+      return {
+        release: async () => {
+          guardReleased = true;
+          guarded = false;
+        },
+      };
+    },
+  };
+  const workspaces = {
+    releaseWorkspace: () => {
+      assert.equal(guarded, true);
+      assert.equal(guardReleased, false);
+      return {
+        id: "ws_guarded",
+        root: "/tmp/devspace-guarded",
+        status: "released" as const,
+        mode: "worktree" as const,
+        managed: true,
+        createdAt: "2026-09-02T00:00:00.000Z",
+        lastUsedAt: "2026-09-02T00:00:00.000Z",
+        terminalAt: "2026-09-03T00:00:00.000Z",
+        terminalReason: "explicit_release",
+      };
+    },
+  };
+
+  const session = await releaseWorkspaceLease(
+    workspaces,
+    processSessions,
+    "ws_guarded",
+  );
+  assert.equal(session.status, "released");
+  assert.equal(guardReleased, true);
+  assert.equal(guarded, false);
 });
 
 test("a process start publishes its workspace lease before the first async yield", async () => {

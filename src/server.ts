@@ -6,6 +6,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
 import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
+import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { checkResourceAllowed, resourceUrlFromServerUrl } from "@modelcontextprotocol/sdk/shared/auth-utils.js";
@@ -15,7 +16,7 @@ import {
   RESOURCE_MIME_TYPE,
 } from "@modelcontextprotocol/ext-apps/server";
 import express from "express";
-import type { Request, Response } from "express";
+import type { NextFunction, Request, Response } from "express";
 import * as z from "zod/v4";
 import {
   isArtifactDownloadSupportedPlatform,
@@ -73,6 +74,7 @@ import {
 } from "./tool-surfaces/types.js";
 
 type Transport = StreamableHTTPServerTransport;
+type AuthenticatedRequest = Request & { auth?: AuthInfo };
 // MCP clients can reconnect without closing the previous transport. Bound stale
 // session retention so abandoned MCP servers do not accumulate for the life of the process.
 const MCP_SESSION_IDLE_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
@@ -733,7 +735,7 @@ export function createServer(
   const workspaceStore = createWorkspaceStore(config.stateDir);
   const workspaces = new WorkspaceRegistry(config, workspaceStore);
   const reviewCheckpoints = createReviewCheckpointManager();
-  const processSessions = options.processSessions
+  const processSessions: ProcessSessionController = options.processSessions
     ?? new ProcessSessionClient({ stateDir: config.stateDir });
   const localAgentProviders = buildLocalAgentProviderStatuses(
     config.subagents,
@@ -779,7 +781,7 @@ export function createServer(
     app.set("trust proxy", true);
   }
 
-  app.use((req, res, next) => {
+  app.use((req: Request, res: Response, next: NextFunction) => {
     const requestId = randomUUID();
     const startedAt = performance.now();
     res.locals.requestId = requestId;
@@ -813,7 +815,7 @@ export function createServer(
     }),
   );
 
-  app.options("/mcp-app-assets/{*asset}", (_req, res) => {
+  app.options("/mcp-app-assets/{*asset}", (_req: Request, res: Response) => {
     setAssetHeaders(res);
     res.sendStatus(204);
   });
@@ -828,11 +830,11 @@ export function createServer(
     }),
   );
 
-  app.get("/healthz", (_req, res) => {
+  app.get("/healthz", (_req: Request, res: Response) => {
     res.json({ ok: true, name: "devspace" });
   });
 
-  app.all("/mcp", async (req, res) => {
+  app.all("/mcp", async (req: AuthenticatedRequest, res: Response) => {
     const requestId = res.locals.requestId as string | undefined;
     const sessionId = req.header("mcp-session-id");
     const initializeRequest = req.method === "POST" && isInitializeRequest(req.body);
@@ -933,7 +935,7 @@ export function createServer(
         clearInterval(sessionCleanupTimer);
         const results = await transports.closeAll();
         logSessionCloseResults("server_shutdown", results);
-        processSessions.shutdown();
+        processSessions.shutdown?.();
         oauthProvider.close();
         workspaceStore.close?.();
       })();

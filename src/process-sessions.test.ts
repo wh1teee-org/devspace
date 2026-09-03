@@ -114,11 +114,18 @@ const defaultInteractive = await manager.start({
 assert.equal(defaultInteractive.running, true);
 assert.ok(defaultInteractive.sessionId);
 
-const defaultInputResult = await manager.write({
+let defaultInputResult = await manager.write({
   workspaceId: "workspace-a",
   sessionId: defaultInteractive.sessionId,
   chars: "hello\n",
 });
+if (defaultInputResult.running && defaultInputResult.sessionId) {
+  defaultInputResult = await manager.write({
+    workspaceId: "workspace-a",
+    sessionId: defaultInputResult.sessionId,
+    yieldTimeMs: 2_000,
+  });
+}
 assert.equal(defaultInputResult.running, false);
 assert.match(defaultInputResult.output, /default-input:hello/);
 

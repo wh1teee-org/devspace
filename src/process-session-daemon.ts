@@ -13,6 +13,7 @@ import {
   LocalAgentDaemonLock,
   ensureLocalAgentDaemonSecret,
   ensureLocalAgentDaemonStateDir,
+  isProcessAlive,
   readLocalAgentDaemonSecret,
   type LocalAgentDaemonPaths,
 } from "./local-agent-daemon-lifecycle.js";
@@ -21,10 +22,11 @@ import {
   type ProcessSessionController,
   type ProcessSnapshot,
   type StartCommandInput,
+  type WorkspaceReleaseGuard,
   type WriteStdinInput,
 } from "./process-sessions.js";
 
-const PROCESS_SESSION_DAEMON_PROTOCOL_VERSION = 1;
+const PROCESS_SESSION_DAEMON_PROTOCOL_VERSION = 2;
 const MAX_REQUEST_BYTES = 2 * 1024 * 1024;
 const DEFAULT_STARTUP_TIMEOUT_MS = 8_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 120_000;
@@ -35,13 +37,26 @@ type ProcessSessionDaemonMethod =
   | "hello"
   | "process.start"
   | "process.write"
+  | "workspace.release_guard.acquire"
+  | "workspace.release_guard.release"
   | "daemon.status"
   | "daemon.stop";
+
+interface WorkspaceReleaseGuardAcquireInput {
+  workspaceId: string;
+  ownerPid: number;
+}
+
+interface WorkspaceReleaseGuardReleaseInput {
+  token: string;
+}
 
 type ProcessSessionDaemonRequest =
   | ProcessSessionDaemonRequestBase<"hello", Record<string, never>>
   | ProcessSessionDaemonRequestBase<"process.start", StartCommandInput>
   | ProcessSessionDaemonRequestBase<"process.write", WriteStdinInput>
+  | ProcessSessionDaemonRequestBase<"workspace.release_guard.acquire", WorkspaceReleaseGuardAcquireInput>
+  | ProcessSessionDaemonRequestBase<"workspace.release_guard.release", WorkspaceReleaseGuardReleaseInput>
   | ProcessSessionDaemonRequestBase<"daemon.status", Record<string, never>>
   | ProcessSessionDaemonRequestBase<"daemon.stop", Record<string, never>>;
 
@@ -110,6 +125,10 @@ export class ProcessSessionDaemon {
   private readonly manager: ProcessSessionManager;
   private readonly lock: LocalAgentDaemonLock;
   private readonly sockets = new Set<Socket>();
+  private readonly workspaceReleaseGuards = new Map<
+    string,
+    { workspaceId: string; ownerPid: number }
+  >();
   private server?: NetServer;
   private authToken?: string;
   private closePromise?: Promise<void>;
@@ -256,9 +275,15 @@ export class ProcessSessionDaemon {
       case "daemon.status":
         return this.status();
       case "process.start":
+        this.assertWorkspaceNotReleaseGuarded(request.params.workspaceId);
         return this.manager.start(request.params);
       case "process.write":
         return this.manager.write(request.params);
+      case "workspace.release_guard.acquire":
+        return this.acquireWorkspaceReleaseGuard(request.params);
+      case "workspace.release_guard.release":
+        this.workspaceReleaseGuards.delete(request.params.token);
+        return {};
       case "daemon.stop":
         if (this.manager.runningCount > 0) {
           throw new ProcessSessionDaemonError(
@@ -269,6 +294,40 @@ export class ProcessSessionDaemon {
         }
         this.stopping = true;
         return this.status();
+    }
+  }
+
+  private acquireWorkspaceReleaseGuard(
+    input: WorkspaceReleaseGuardAcquireInput,
+  ): { token: string } {
+    this.pruneWorkspaceReleaseGuards();
+    if (this.manager.hasRunningForWorkspace(input.workspaceId)) {
+      throw new ProcessSessionDaemonError(
+        "RUNNING_PROCESSES",
+        `Workspace ${input.workspaceId} still owns a running process session.`,
+        true,
+      );
+    }
+    const token = randomUUID();
+    this.workspaceReleaseGuards.set(token, input);
+    return { token };
+  }
+
+  private assertWorkspaceNotReleaseGuarded(workspaceId: string): void {
+    this.pruneWorkspaceReleaseGuards();
+    for (const guard of this.workspaceReleaseGuards.values()) {
+      if (guard.workspaceId !== workspaceId) continue;
+      throw new ProcessSessionDaemonError(
+        "WORKSPACE_RELEASING",
+        `Workspace ${workspaceId} is being released and cannot start a process session.`,
+        true,
+      );
+    }
+  }
+
+  private pruneWorkspaceReleaseGuards(): void {
+    for (const [token, guard] of this.workspaceReleaseGuards) {
+      if (!isProcessAlive(guard.ownerPid)) this.workspaceReleaseGuards.delete(token);
     }
   }
 
@@ -320,6 +379,28 @@ export class ProcessSessionClient implements ProcessSessionController {
 
   async write(input: WriteStdinInput): Promise<ProcessSnapshot> {
     return decodeSnapshot(await this.request("process.write", input));
+  }
+
+  async acquireWorkspaceReleaseGuard(workspaceId: string): Promise<WorkspaceReleaseGuard> {
+    const result = asRecord(await this.request("workspace.release_guard.acquire", {
+      workspaceId,
+      ownerPid: process.pid,
+    }));
+    if (!result) {
+      throw new ProcessSessionDaemonError(
+        "INVALID_RESPONSE",
+        "Process session daemon returned an invalid workspace release guard.",
+      );
+    }
+    const token = requiredString(result.token, "token");
+    let released = false;
+    return {
+      release: async () => {
+        if (released) return;
+        released = true;
+        await this.requestExisting("workspace.release_guard.release", { token });
+      },
+    };
   }
 
   async status(): Promise<ProcessSessionDaemonStatus> {
@@ -396,7 +477,12 @@ export class ProcessSessionClient implements ProcessSessionController {
 
   private async requestExisting(
     method: ProcessSessionDaemonMethod,
-    params: StartCommandInput | WriteStdinInput | Record<string, never>,
+    params:
+      | StartCommandInput
+      | WriteStdinInput
+      | WorkspaceReleaseGuardAcquireInput
+      | WorkspaceReleaseGuardReleaseInput
+      | Record<string, never>,
   ): Promise<unknown> {
     const authToken = readLocalAgentDaemonSecret(this.paths);
     if (!authToken) {
@@ -636,6 +722,31 @@ function decodeRequest(value: unknown): ProcessSessionDaemonRequest {
       return { requestId, protocolVersion, authToken, method, params: decodeStartInput(record.params) };
     case "process.write":
       return { requestId, protocolVersion, authToken, method, params: decodeWriteInput(record.params) };
+    case "workspace.release_guard.acquire": {
+      const params = asRecord(record.params);
+      if (!params) throw new ProcessSessionDaemonError("INVALID_REQUEST", "Workspace release guard params must be an object.");
+      return {
+        requestId,
+        protocolVersion,
+        authToken,
+        method,
+        params: {
+          workspaceId: requiredString(params.workspaceId, "workspaceId"),
+          ownerPid: requiredInteger(params.ownerPid, "ownerPid"),
+        },
+      };
+    }
+    case "workspace.release_guard.release": {
+      const params = asRecord(record.params);
+      if (!params) throw new ProcessSessionDaemonError("INVALID_REQUEST", "Workspace release guard params must be an object.");
+      return {
+        requestId,
+        protocolVersion,
+        authToken,
+        method,
+        params: { token: requiredString(params.token, "token") },
+      };
+    }
     default:
       throw new ProcessSessionDaemonError("UNKNOWN_METHOD", `Unknown process session daemon method: ${method}`);
   }
