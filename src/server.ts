@@ -834,11 +834,7 @@ export function createServer(
     }),
   );
 
-<<<<<<< HEAD
   app.get("/healthz", (_req: Request, res: Response) => {
-    res.json({ ok: true, name: "devspace" });
-=======
-  app.get("/healthz", (_req, res) => {
     res.json({
       ok: true,
       name: "devspace",
@@ -846,7 +842,6 @@ export function createServer(
       occupiedSessionCapacity: transports.occupiedCapacity,
       maxMcpSessions: MCP_SESSION_MAX_SESSIONS,
     });
->>>>>>> 65a2492 (fix(mcp): bound session capacity)
   });
 
   app.all("/mcp", async (req: AuthenticatedRequest, res: Response) => {
