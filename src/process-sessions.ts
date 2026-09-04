@@ -1,4 +1,10 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import {
+  cgroupEnterInvocation,
+  createProcessSessionCgroup,
+  type ProcessSessionCgroup,
+} from "./process-cgroup.js";
 import { resolveShellCommand, terminateProcessTree } from "./process-platform.js";
 
 const DEFAULT_EXEC_YIELD_MS = 10_000;
@@ -75,6 +81,7 @@ interface ProcessSession {
   running: boolean;
   exitCode?: number;
   signal?: string;
+  cgroup?: ProcessSessionCgroup;
   exitPromise: Promise<void>;
   resolveExit: () => void;
   cleanupTimer?: NodeJS.Timeout;
@@ -83,6 +90,7 @@ interface ProcessSession {
 interface ProcessSessionManagerOptions {
   maxBufferCharacters?: number;
   completedSessionTtlMs?: number;
+  cgroupIsolation?: boolean;
 }
 
 function boundedInteger(value: number | undefined, fallback: number, maximum: number): number {
@@ -232,11 +240,16 @@ export class ProcessSessionManager {
   private readonly sessions = new Map<number, ProcessSession>();
   private readonly maxBufferCharacters: number;
   private readonly completedSessionTtlMs: number;
+  private readonly cgroupIsolation: boolean;
+  private readonly cgroupPrefix =
+    `session-${process.pid}-${randomUUID().replaceAll("-", "").slice(0, 16)}`;
   private nextSessionId = 1;
 
   constructor(options: ProcessSessionManagerOptions = {}) {
     this.maxBufferCharacters = options.maxBufferCharacters ?? DEFAULT_BUFFER_CHARACTERS;
     this.completedSessionTtlMs = options.completedSessionTtlMs ?? COMPLETED_SESSION_TTL_MS;
+    this.cgroupIsolation = options.cgroupIsolation
+      ?? process.env.DEVSPACE_PROCESS_SESSION_CGROUP === "1";
   }
 
   get runningCount(): number {
@@ -256,9 +269,22 @@ export class ProcessSessionManager {
     this.sessions.set(session.id, session);
 
     try {
+      if (this.cgroupIsolation) {
+        session.cgroup = createProcessSessionCgroup(`${this.cgroupPrefix}-${session.id}`);
+      }
       if (input.tty && process.platform !== "win32") await this.startPty(session, input);
       else this.startPipe(session, input);
     } catch (error) {
+      if (session.cgroup) {
+        try {
+          session.cgroup.disposeEmpty();
+        } catch (cleanupError) {
+          throw new AggregateError(
+            [error, cleanupError],
+            "Process session failed to start and its delegated cgroup could not be removed.",
+          );
+        }
+      }
       this.sessions.delete(session.id);
       throw error;
     }
@@ -366,14 +392,25 @@ export class ProcessSessionManager {
     });
     const shell = resolveShellCommand(input.command, process.platform, environment);
     const detached = process.platform !== "win32";
-    const child = spawn(input.command, {
+    const invocation = session.cgroup
+      ? cgroupEnterInvocation(session.cgroup.path, shell.executable, ["-c", input.command])
+      : undefined;
+    const child = invocation
+      ? spawn(invocation.executable, invocation.args, {
+          cwd: input.cwd,
+          env: environment,
+          stdio: "pipe",
+          windowsHide: true,
+          detached,
+        })
+      : spawn(input.command, {
       cwd: input.cwd,
       env: environment,
       stdio: "pipe",
       windowsHide: true,
       detached,
       shell: shell.executable,
-    });
+        });
 
     session.process = {
       write: (data) => child.stdin.write(data),
@@ -383,7 +420,9 @@ export class ProcessSessionManager {
     child.stdout.on("data", (data: Buffer) => this.append(session, data.toString("utf8")));
     child.stderr.on("data", (data: Buffer) => this.append(session, data.toString("utf8")));
     child.on("error", (error) => this.append(session, `${error.message}\n`));
-    child.on("close", (code, signal) => this.finish(session, code ?? undefined, signal ?? undefined));
+    child.on("close", (code, signal) => {
+      void this.finishAfterProcessExit(session, code ?? undefined, signal ?? undefined);
+    });
   }
 
   private async startPty(session: ProcessSession, input: StartCommandInput): Promise<void> {
@@ -400,28 +439,60 @@ export class ProcessSessionManager {
       environment: input.environment,
     });
     const shell = resolveShellCommand(input.command, process.platform, environment);
+    const invocation = session.cgroup
+      ? cgroupEnterInvocation(session.cgroup.path, shell.executable, shell.args)
+      : shell;
     let pty: import("node-pty").IPty;
     try {
-      pty = nodePty.spawn(shell.executable, shell.args, {
-        cwd: input.cwd,
-        env: environment,
-        name: "xterm-256color",
-        cols: session.columns,
-        rows: session.rows,
-      });
+      pty = nodePty.spawn(
+        invocation.executable,
+        invocation.args,
+        {
+          cwd: input.cwd,
+          env: environment,
+          name: "xterm-256color",
+          cols: session.columns,
+          rows: session.rows,
+        },
+      );
     } catch (error) {
       throw error;
     }
 
     session.process = {
       write: (data) => pty.write(data),
-      kill: (signal) => pty.kill(signal),
+      kill: (signal = "SIGTERM") => pty.kill(signal),
       resize: (columns, rows) => pty.resize(columns, rows),
     };
     pty.onData((data) => this.append(session, data));
     pty.onExit(({ exitCode, signal }) => {
-      this.finish(session, exitCode, signal === 0 ? undefined : String(signal));
+      void this.finishAfterProcessExit(
+        session,
+        exitCode,
+        signal === 0 ? undefined : String(signal),
+      );
     });
+  }
+
+  private async finishAfterProcessExit(
+    session: ProcessSession,
+    exitCode?: number,
+    signal?: string,
+  ): Promise<void> {
+    if (!session.running) return;
+    if (session.cgroup) {
+      try {
+        await session.cgroup.retire();
+      } catch (error) {
+        this.append(
+          session,
+          `Process-session cgroup cleanup failed: ${error instanceof Error ? error.message : String(error)}\n`,
+        );
+        exitCode = exitCode && exitCode !== 0 ? exitCode : 1;
+        signal = undefined;
+      }
+    }
+    this.finish(session, exitCode, signal);
   }
 
   private finish(session: ProcessSession, exitCode?: number, signal?: string): void {
