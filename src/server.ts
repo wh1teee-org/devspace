@@ -6,6 +6,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
 import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
+import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { checkResourceAllowed, resourceUrlFromServerUrl } from "@modelcontextprotocol/sdk/shared/auth-utils.js";
@@ -15,7 +16,7 @@ import {
   RESOURCE_MIME_TYPE,
 } from "@modelcontextprotocol/ext-apps/server";
 import express from "express";
-import type { Request, Response } from "express";
+import type { NextFunction, Request, Response } from "express";
 import * as z from "zod/v4";
 import {
   isArtifactDownloadSupportedPlatform,
@@ -783,7 +784,7 @@ export function createServer(
     app.set("trust proxy", true);
   }
 
-  app.use((req, res, next) => {
+  app.use((req: Request, res: Response, next: NextFunction) => {
     const requestId = randomUUID();
     const startedAt = performance.now();
     res.locals.requestId = requestId;
@@ -817,7 +818,7 @@ export function createServer(
     }),
   );
 
-  app.options("/mcp-app-assets/{*asset}", (_req, res) => {
+  app.options("/mcp-app-assets/{*asset}", (_req: Request, res: Response) => {
     setAssetHeaders(res);
     res.sendStatus(204);
   });
@@ -832,7 +833,7 @@ export function createServer(
     }),
   );
 
-  app.get("/healthz", (_req, res) => {
+  app.get("/healthz", (_req: Request, res: Response) => {
     res.json({
       ok: true,
       name: "devspace",
@@ -842,7 +843,7 @@ export function createServer(
     });
   });
 
-  app.all("/mcp", async (req, res) => {
+  app.all("/mcp", async (req: Request & { auth?: AuthInfo }, res: Response) => {
     const requestId = res.locals.requestId as string | undefined;
     const sessionId = req.header("mcp-session-id");
     const initializeRequest = req.method === "POST" && isInitializeRequest(req.body);
