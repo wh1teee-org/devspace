@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   cgroupEnterInvocation,
   parseCgroupPopulated,
   parseUnifiedCgroupPath,
+  ProcessSessionCgroup,
 } from "./process-cgroup.js";
 
 assert.equal(
@@ -41,3 +45,25 @@ assert.deepEqual(
     ],
   },
 );
+
+const retireRoot = mkdtempSync(join(tmpdir(), "devspace-cgroup-retire-"));
+try {
+  await assert.doesNotReject(
+    new ProcessSessionCgroup(join(retireRoot, "already-removed")).retire(100),
+  );
+
+  const disappearing = join(retireRoot, "disappearing");
+  mkdirSync(disappearing);
+  writeFileSync(join(disappearing, "cgroup.events"), "populated 1\n", "utf8");
+  writeFileSync(join(disappearing, "cgroup.kill"), "", "utf8");
+  const remove = setTimeout(() => {
+    rmSync(disappearing, { recursive: true, force: true });
+  }, 5);
+  try {
+    await assert.doesNotReject(new ProcessSessionCgroup(disappearing).retire(100));
+  } finally {
+    clearTimeout(remove);
+  }
+} finally {
+  rmSync(retireRoot, { recursive: true, force: true });
+}

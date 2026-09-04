@@ -33,6 +33,32 @@ const manager = new ProcessSessionManager({
   completedSessionTtlMs: 1_000,
 });
 
+const failedStartManager = new ProcessSessionManager({
+  cgroupIsolation: true,
+  createCgroup: () => ({
+    path: "\0invalid-cgroup",
+    retire: async () => undefined,
+    disposeEmpty: () => {
+      throw new Error("fixture cgroup cleanup failed");
+    },
+  }),
+});
+await assert.rejects(
+  failedStartManager.start({
+    workspaceId: "workspace-failed-start",
+    cwd: process.cwd(),
+    command: "echo unreachable",
+  }),
+  (error) => {
+    assert.ok(error instanceof AggregateError);
+    assert.equal(error.errors.length, 2);
+    assert.match(String(error.errors[1]), /fixture cgroup cleanup failed/);
+    return true;
+  },
+);
+assert.equal(failedStartManager.sessionCount, 0);
+assert.equal(failedStartManager.runningCount, 0);
+
 const node = process.platform === "win32"
   ? `"${process.execPath}"`
   : JSON.stringify(process.execPath);

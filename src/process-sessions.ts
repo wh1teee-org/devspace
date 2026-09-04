@@ -91,6 +91,7 @@ interface ProcessSessionManagerOptions {
   maxBufferCharacters?: number;
   completedSessionTtlMs?: number;
   cgroupIsolation?: boolean;
+  createCgroup?: (name: string) => ProcessSessionCgroup;
 }
 
 function boundedInteger(value: number | undefined, fallback: number, maximum: number): number {
@@ -241,6 +242,7 @@ export class ProcessSessionManager {
   private readonly maxBufferCharacters: number;
   private readonly completedSessionTtlMs: number;
   private readonly cgroupIsolation: boolean;
+  private readonly createCgroup: (name: string) => ProcessSessionCgroup;
   private readonly cgroupPrefix =
     `session-${process.pid}-${randomUUID().replaceAll("-", "").slice(0, 16)}`;
   private nextSessionId = 1;
@@ -250,6 +252,7 @@ export class ProcessSessionManager {
     this.completedSessionTtlMs = options.completedSessionTtlMs ?? COMPLETED_SESSION_TTL_MS;
     this.cgroupIsolation = options.cgroupIsolation
       ?? process.env.DEVSPACE_PROCESS_SESSION_CGROUP === "1";
+    this.createCgroup = options.createCgroup ?? createProcessSessionCgroup;
   }
 
   get runningCount(): number {
@@ -270,11 +273,14 @@ export class ProcessSessionManager {
 
     try {
       if (this.cgroupIsolation) {
-        session.cgroup = createProcessSessionCgroup(`${this.cgroupPrefix}-${session.id}`);
+        session.cgroup = this.createCgroup(`${this.cgroupPrefix}-${session.id}`);
       }
       if (input.tty && process.platform !== "win32") await this.startPty(session, input);
       else this.startPipe(session, input);
     } catch (error) {
+      this.sessions.delete(session.id);
+      session.running = false;
+      session.resolveExit();
       if (session.cgroup) {
         try {
           session.cgroup.disposeEmpty();
@@ -285,7 +291,6 @@ export class ProcessSessionManager {
           );
         }
       }
-      this.sessions.delete(session.id);
       throw error;
     }
 

@@ -67,30 +67,62 @@ export function cgroupEnterInvocation(
   };
 }
 
+function readCgroupPopulated(events: string): boolean | undefined {
+  try {
+    return parseCgroupPopulated(readFileSync(events, "utf8"));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+function removeCgroupIfPresent(path: string): void {
+  try {
+    rmdirSync(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+}
+
 export class ProcessSessionCgroup {
   constructor(readonly path: string) {}
 
   async retire(timeoutMs = DEFAULT_RETIRE_TIMEOUT_MS): Promise<void> {
     const events = join(this.path, "cgroup.events");
-    if (parseCgroupPopulated(readFileSync(events, "utf8"))) {
-      writeFileSync(join(this.path, "cgroup.kill"), "1\n", "utf8");
+    const initial = readCgroupPopulated(events);
+    if (initial === undefined) return;
+    if (initial) {
+      try {
+        writeFileSync(join(this.path, "cgroup.kill"), "1\n", "utf8");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+        throw error;
+      }
     }
 
     const deadline = Date.now() + timeoutMs;
-    while (parseCgroupPopulated(readFileSync(events, "utf8"))) {
+    while (true) {
+      const populated = readCgroupPopulated(events);
+      if (populated === undefined) return;
+      if (!populated) {
+        removeCgroupIfPresent(this.path);
+        return;
+      }
       if (Date.now() >= deadline) {
         throw new Error(`Process-session cgroup did not become empty: ${this.path}`);
       }
       await new Promise((resolve) => setTimeout(resolve, RETIRE_POLL_MS));
     }
-    rmdirSync(this.path);
   }
 
   disposeEmpty(): void {
-    if (parseCgroupPopulated(readFileSync(join(this.path, "cgroup.events"), "utf8"))) {
+    const populated = readCgroupPopulated(join(this.path, "cgroup.events"));
+    if (populated === undefined) return;
+    if (populated) {
       throw new Error(`Cannot dispose populated process-session cgroup: ${this.path}`);
     }
-    rmdirSync(this.path);
+    removeCgroupIfPresent(this.path);
   }
 }
 
